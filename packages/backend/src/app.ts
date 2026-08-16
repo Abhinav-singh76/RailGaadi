@@ -3,15 +3,13 @@ import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
 import path from 'path';
-import { fileURLToPath } from 'url';
 import { trainsRouter } from './routes/trains.router.js';
 import { contextRouter } from './routes/context.router.js';
 import { shareRouter } from './routes/share.router.js';
 
 dotenv.config();
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+// This file compiles to CommonJS, so __dirname is already available natively — no ESM workaround needed.
 
 const app = express();
 const PORT = process.env.PORT || 3001;

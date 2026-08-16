@@ -1,0 +1,12 @@
+{
+  "name": "@railgaadi/types",
+  "version": "1.0.0",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "npx -p typescript tsc"
+  },
+  "devDependencies": {
+    "typescript": "^5.3.3"
+  }
+}

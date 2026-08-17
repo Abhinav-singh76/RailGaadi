@@ -30,8 +30,6 @@ interface RRStop {
   delayDeparture?: number;
   platform?: string;
   speedToNextStationKmph?: number;
-  lat?: number;
-  lng?: number;
 }
 
 interface RRRouteStop {
@@ -50,14 +48,16 @@ export class RailRadarProvider implements IRailProvider {
   private fallback: MockRailProvider;
   private weather: OpenWeatherProvider;
   private base = 'https://api.railradar.in/v1';
+  private TIMEOUT_MS = 15000; // 15s timeout per request
 
-  // Cache full lookup map (train number → name) for fast search
+  // Response cache: path → { data, ts }
+  private cache = new Map<string, { data: any; ts: number }>();
+  private LIVE_TTL = 30_000;        // 30s for live data
+  private STATIC_TTL = 3_600_000;  // 1hr for timetables/routes
+
+  // Lookup cache for 13k train map
   private lookupCache: Record<string, string> | null = null;
   private lookupFetchedAt = 0;
-  private requestCache = new Map<string, { data: any; timestamp: number }>();
-  private inFlight = new Map<string, Promise<any>>();
-  private lastRequestTime = 0;
-  private readonly MIN_REQUEST_INTERVAL_MS = 250;
 
   constructor() {
     this.apiKey = process.env.RAILRADAR_API_KEY || 'rg_28e6a44d86e44304bf8a0fd8b23527c0';
@@ -65,111 +65,70 @@ export class RailRadarProvider implements IRailProvider {
     this.weather = new OpenWeatherProvider();
   }
 
-  private headers(): HeadersInit {
-    return {
-      Authorization: `Bearer ${this.apiKey}`,
-      'x-api-key': this.apiKey,
-      Accept: 'application/json',
-    };
-  }
-
-  private formatTime(val?: string | null): string | null {
-    if (!val) return null;
-    const str = String(val).trim();
-    if (/^\d{1,2}:\d{2}(:\d{2})?$/.test(str)) {
-      return str.slice(0, 5);
-    }
-    const d = new Date(str);
-    if (!isNaN(d.getTime())) {
-      return d.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', hour12: false });
-    }
-    return str;
-  }
-
-  private async sleep(ms: number): Promise<void> {
-    return new Promise((resolve) => setTimeout(resolve, ms));
-  }
-
-  private async get<T = any>(path: string, retries = 2): Promise<T | null> {
-    const isLive = path.includes('/live');
-    const ttl = isLive ? 30 * 1000 : 60 * 60 * 1000; // 30s for live, 1 hour for static routes/timetable
-
-    // 1. Check in-memory cache
-    const cached = this.requestCache.get(path);
-    if (cached && Date.now() - cached.timestamp < ttl) {
+  // ── Fetch with timeout and caching ─────────────────────────────────────────
+  private async get<T = any>(path: string): Promise<T | null> {
+    const ttl = path.includes('/live') ? this.LIVE_TTL : this.STATIC_TTL;
+    const cached = this.cache.get(path);
+    if (cached && Date.now() - cached.ts < ttl) {
       return cached.data as T;
     }
 
-    // 2. Reuse in-flight requests to prevent duplicate requests
-    if (this.inFlight.has(path)) {
-      try {
-        return (await this.inFlight.get(path)) as T;
-      } catch {
-        // continue to fetch
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), this.TIMEOUT_MS);
+
+      const res = await fetch(`${this.base}${path}`, {
+        headers: {
+          Authorization: `Bearer ${this.apiKey}`,
+          Accept: 'application/json',
+        },
+        signal: controller.signal,
+      });
+
+      clearTimeout(timer);
+
+      if (!res.ok) {
+        console.warn(`[RailRadar] ${path} → HTTP ${res.status}`);
+        return cached ? (cached.data as T) : null;
       }
-    }
 
-    const fetchPromise = (async () => {
-      for (let attempt = 0; attempt <= retries; attempt++) {
-        try {
-          // Throttle requests so we never burst over the rate limit
-          const now = Date.now();
-          const elapsed = now - this.lastRequestTime;
-          if (elapsed < this.MIN_REQUEST_INTERVAL_MS) {
-            await this.sleep(this.MIN_REQUEST_INTERVAL_MS - elapsed);
-          }
-          this.lastRequestTime = Date.now();
+      const body = await res.json();
+      if (!body.success) {
+        console.warn(`[RailRadar] ${path} → API error: ${body.error?.message}`);
+        return cached ? (cached.data as T) : null;
+      }
 
-          const res = await fetch(`${this.base}${path}`, { headers: this.headers() });
-          
-          if (res.status === 429) {
-            console.warn(`[RailRadar] Rate limit 429 on ${path}, attempt ${attempt + 1}/${retries + 1}`);
-            if (cached) {
-              return cached.data as T;
-            }
-            if (attempt < retries) {
-              await this.sleep(1200 * (attempt + 1));
-              continue;
-            }
-            return null;
-          }
-
-          if (!res.ok) {
-            console.warn(`[RailRadar] ${path} → HTTP ${res.status}`);
-            return cached ? (cached.data as T) : null;
-          }
-
-          const body = await res.json();
-          if (!body.success) {
-            console.warn(`[RailRadar] ${path} → API error: ${body.error?.message}`);
-            return cached ? (cached.data as T) : null;
-          }
-
-          this.requestCache.set(path, { data: body.data, timestamp: Date.now() });
-          return body.data as T;
-        } catch (e: any) {
-          console.warn(`[RailRadar] ${path} → network error: ${e.message}`);
-          if (attempt < retries) {
-            await this.sleep(800 * (attempt + 1));
-            continue;
-          }
-          return cached ? (cached.data as T) : null;
-        }
+      this.cache.set(path, { data: body.data, ts: Date.now() });
+      return body.data as T;
+    } catch (e: any) {
+      if (e.name === 'AbortError') {
+        console.warn(`[RailRadar] ${path} → TIMEOUT after ${this.TIMEOUT_MS}ms`);
+      } else {
+        console.warn(`[RailRadar] ${path} → ${e.message}`);
       }
       return cached ? (cached.data as T) : null;
-    })();
-
-    this.inFlight.set(path, fetchPromise);
-    try {
-      return await fetchPromise;
-    } finally {
-      this.inFlight.delete(path);
     }
   }
 
-  // ── Train type inference ───────────────────────────────────────────────────
-  private trainType(name: string, type?: string): Train['trainType'] {
-    const s = `${name} ${type || ''}`.toLowerCase();
+  // ── Helpers ─────────────────────────────────────────────────────────────────
+  private fmtTime(val?: string | null): string | null {
+    if (!val) return null;
+    // Already HH:mm or HH:mm:ss
+    if (/^\d{1,2}:\d{2}/.test(val)) return val.slice(0, 5);
+    // ISO timestamp
+    try {
+      return new Date(val).toLocaleTimeString('en-IN', {
+        hour: '2-digit',
+        minute: '2-digit',
+        hour12: false,
+      });
+    } catch {
+      return null;
+    }
+  }
+
+  private trainType(name: string, type = ''): Train['trainType'] {
+    const s = `${name} ${type}`.toLowerCase();
     if (s.includes('vande bharat')) return 'Vande Bharat';
     if (s.includes('rajdhani')) return 'Rajdhani';
     if (s.includes('shatabdi') || s.includes('tejas')) return 'Shatabdi';
@@ -177,52 +136,48 @@ export class RailRadarProvider implements IRailProvider {
     return 'Express';
   }
 
-  // ── Map a RailRadar `train` object → our Train interface ──────────────────
   private mapTrain(t: any, num: string): Train {
     return {
-      id: String(t.number || num),
-      number: String(t.number || num),
-      name: t.name || `Express #${num}`,
-      origin: t.source?.name || 'Origin Station',
-      originCode: t.source?.code || 'SRC',
-      destination: t.destination?.name || 'Destination Station',
-      destinationCode: t.destination?.code || 'DST',
-      totalDistanceKm: t.distance || 800,
-      expectedDurationMinutes: t.duration || 600,
-      trainType: this.trainType(t.name || '', t.type || ''),
+      id: String(t?.number || num),
+      number: String(t?.number || num),
+      name: t?.name || `Express #${num}`,
+      origin: t?.source?.name || 'Origin Station',
+      originCode: t?.source?.code || 'SRC',
+      destination: t?.destination?.name || 'Destination Station',
+      destinationCode: t?.destination?.code || 'DST',
+      totalDistanceKm: t?.distance || 800,
+      expectedDurationMinutes: t?.duration || 600,
+      trainType: this.trainType(t?.name || '', t?.type || ''),
     };
   }
 
-  // ── Fetch and cache the full 13k train lookup ─────────────────────────────
+  // ── Lookup all 13k trains ────────────────────────────────────────────────────
   private async getLookup(): Promise<Record<string, string>> {
     const now = Date.now();
-    if (this.lookupCache && now - this.lookupFetchedAt < 3_600_000) {
+    if (this.lookupCache && now - this.lookupFetchedAt < this.STATIC_TTL) {
       return this.lookupCache;
     }
     const data = await this.get<Record<string, string>>('/lookup/trains');
     if (data) {
       this.lookupCache = data;
       this.lookupFetchedAt = now;
-      return data;
     }
-    return {};
+    return this.lookupCache || {};
   }
 
-  // ── SEARCH TRAINS ─────────────────────────────────────────────────────────
+  // ── Search ────────────────────────────────────────────────────────────────────
   async searchTrains(query: string): Promise<Train[]> {
     const q = query.trim().toLowerCase();
     if (!q) return this.fallback.searchTrains('');
 
     try {
-      // 1. If it's a number, try fetching that exact train
+      // Exact 5-digit train number → fetch that train directly
       if (/^\d{4,5}$/.test(q)) {
         const data = await this.get<any>(`/trains/${q}`);
-        if (data?.train) {
-          return [this.mapTrain(data.train, q)];
-        }
+        if (data?.train) return [this.mapTrain(data.train, q)];
       }
 
-      // 2. Search across the full lookup map
+      // Fuzzy search over full lookup map
       const lookup = await this.getLookup();
       const results: Train[] = [];
       for (const [num, name] of Object.entries(lookup)) {
@@ -243,47 +198,47 @@ export class RailRadarProvider implements IRailProvider {
         }
       }
 
-      // If we got results but no coordinates, enrich first 3 with actual data
+      // Enrich first result with actual route data
       if (results.length > 0) {
-        const enriched = await Promise.allSettled(
-          results.slice(0, 3).map(async (tr) => {
-            const d = await this.get<any>(`/trains/${tr.number}`);
-            return d?.train ? this.mapTrain(d.train, tr.number) : tr;
-          })
-        );
-        enriched.forEach((r, i) => {
-          if (r.status === 'fulfilled') results[i] = r.value;
-        });
+        const data = await this.get<any>(`/trains/${results[0].number}`);
+        if (data?.train) results[0] = this.mapTrain(data.train, results[0].number);
       }
 
       if (results.length > 0) return results;
     } catch (e: any) {
-      console.warn('[RailRadar] searchTrains failed:', e.message);
+      console.warn('[RailRadar] searchTrains error:', e.message);
     }
 
     return this.fallback.searchTrains(query);
   }
 
-  // ── TRAINS BETWEEN STATIONS ───────────────────────────────────────────────
+  // ── Trains between stations ────────────────────────────────────────────────
   async getTrainsBetweenStations(from: string, to: string): Promise<Train[]> {
     try {
-      const data = await this.get<any>(`/trains/between/${from.toUpperCase()}/${to.toUpperCase()}`);
-      if (Array.isArray(data)) {
-        return data.map((item: any) => ({
-          id: String(item.trainNumber || item.number),
-          number: String(item.trainNumber || item.number),
-          name: item.trainName || item.name || 'Express',
-          origin: item.fromStationName || from,
-          originCode: item.fromStationCode || from,
-          destination: item.toStationName || to,
-          destinationCode: item.toStationCode || to,
-          totalDistanceKm: item.distance || 600,
-          expectedDurationMinutes: item.duration || 480,
-          trainType: this.trainType(item.trainName || item.name || ''),
-        }));
+      const data = await this.get<any>(
+        `/trains/between/${from.toUpperCase()}/${to.toUpperCase()}`
+      );
+      // RailRadar returns { from, to, trains: [...], count }
+      const trains = data?.trains || (Array.isArray(data) ? data : []);
+      if (trains.length > 0) {
+        return trains.map((item: any) => {
+          const t = item.train || item;
+          return {
+            id: String(t.number || t.trainNumber || ''),
+            number: String(t.number || t.trainNumber || ''),
+            name: t.name || t.trainName || 'Express',
+            origin: item.from?.name || from,
+            originCode: item.from?.code || from,
+            destination: item.to?.name || to,
+            destinationCode: item.to?.code || to,
+            totalDistanceKm: item.distance || 600,
+            expectedDurationMinutes: item.duration || 480,
+            trainType: this.trainType(t.name || t.trainName || '', t.type || ''),
+          };
+        });
       }
     } catch (e: any) {
-      console.warn('[RailRadar] getTrainsBetweenStations failed:', e.message);
+      console.warn('[RailRadar] getTrainsBetweenStations error:', e.message);
     }
     return this.fallback.getTrainsBetweenStations(from, to);
   }
@@ -294,127 +249,44 @@ export class RailRadarProvider implements IRailProvider {
     return this.fallback.getTrainById(id);
   }
 
-  // ── LIVE JOURNEY STATUS ───────────────────────────────────────────────────
+  // ── Live Journey ───────────────────────────────────────────────────────────
   async getLiveJourney(trainId: string): Promise<LiveJourneyStatus | null> {
     const data = await this.get<any>(`/trains/${trainId}/live?authoritative=true`);
-
-    if (!data) {
-      // Fallback to static train timetable if live status endpoint is not active
-      const trainData = await this.get<any>(`/trains/${trainId}`);
-      if (trainData?.train) {
-        const train = this.mapTrain(trainData.train, trainId);
-        const stops: any[] = Array.isArray(trainData.route) ? trainData.route : Object.values(trainData.route || {});
-        const haltStops = stops.filter((s) => s.isHalt);
-        const originHalt = haltStops[0] || stops[0] || {};
-        const nextHalt = haltStops[1] || stops[1] || originHalt;
-
-        const originLat = originHalt.station?.lat || trainData.train.source?.lat || 28.6139;
-        const originLng = originHalt.station?.lng || trainData.train.source?.lng || 77.209;
-        const nextLat = nextHalt.station?.lat || trainData.train.destination?.lat || originLat;
-        const nextLng = nextHalt.station?.lng || trainData.train.destination?.lng || originLng;
-
-        const curStation: Station = {
-          id: `S-${originHalt.station?.code || train.originCode}`,
-          code: originHalt.station?.code || train.originCode,
-          name: originHalt.station?.name || train.origin,
-          latitude: originLat,
-          longitude: originLng,
-        };
-
-        const nxtStation: Station = {
-          id: `S-${nextHalt.station?.code || train.destinationCode}`,
-          code: nextHalt.station?.code || train.destinationCode,
-          name: nextHalt.station?.name || train.destination,
-          latitude: nextLat,
-          longitude: nextLng,
-        };
-
-        const currentStationEvent: StationEvent = {
-          journeyId: `J-${trainId}`,
-          stationId: curStation.id,
-          station: curStation,
-          distanceFromOriginKm: 0,
-          scheduledArrival: null,
-          actualArrival: null,
-          scheduledDeparture: this.formatTime(originHalt.departure),
-          actualDeparture: null,
-          delayMinutes: 0,
-          status: 'upcoming',
-          platform: originHalt.platform || '1',
-        };
-
-        const nextStationEvent: StationEvent = {
-          journeyId: `J-${trainId}`,
-          stationId: nxtStation.id,
-          station: nxtStation,
-          distanceFromOriginKm: nextHalt.distance || 50,
-          scheduledArrival: this.formatTime(nextHalt.arrival),
-          actualArrival: null,
-          scheduledDeparture: this.formatTime(nextHalt.departure),
-          actualDeparture: null,
-          delayMinutes: 0,
-          status: 'upcoming',
-          platform: nextHalt.platform || '1',
-        };
-
-        return {
-          id: `LJ-${trainId}-sched`,
-          trainId,
-          train,
-          serviceDate: new Date().toISOString().split('T')[0],
-          position: {
-            latitude: originLat,
-            longitude: originLng,
-            speedKmph: 0,
-            headingDegrees: 0,
-          },
-          currentStation: currentStationEvent,
-          nextStation: nextStationEvent,
-          delayMinutes: 0,
-          distanceCoveredKm: 0,
-          distanceRemainingKm: train.totalDistanceKm,
-          completionPercentage: 0,
-          lastUpdated: new Date().toISOString(),
-          statusText: `Scheduled service from ${train.origin} to ${train.destination}.`,
-          hasLiveData: false,
-          isStale: true,
-        };
-      }
-      return this.fallback.getLiveJourney(trainId);
-    }
+    if (!data) return this.fallback.getLiveJourney(trainId);
 
     try {
-      const train = this.mapTrain(data.train || {}, trainId);
+      const train = this.mapTrain(data.train, trainId);
       const curLoc = data.currentLocation || {};
-      const prevHalt = data.previousHalt || {};
-      const delayMinutes: number = data.delayMinutes ?? curLoc.delayMinutes ?? 0;
+      const delay: number = Number(data.delayMinutes ?? curLoc.delayMinutes ?? 0);
       const isLive: boolean = !!data.isLive;
 
-      // Build route stops from route object (keyed 0..N)
-      const rawStops: RRStop[] = Array.isArray(data.route) ? data.route : Object.values(data.route || {});
-      const halts = rawStops.filter((s) => s.isHalt);
+      // Use API-provided nextHalt and previousHalt directly (much more reliable)
+      const nextHalt = data.nextHalt;
+      const prevHalt = data.previousHalt || curLoc;
 
-      // Find current and next halt
-      const curHalt = halts.find((s) => s.status === 'at-station') ||
-        halts.filter((s) => s.status === 'departed').pop() ||
-        halts[0] || rawStops[0];
-      const nextHalt = halts.find((s) => s.status === 'not-departed') || halts[1] || curHalt;
+      // Current position coordinates
+      const lat: number = curLoc.coordinates?.lat || 19.076;
+      const lng: number = curLoc.coordinates?.lng || 72.877;
 
       const totalDistance = train.totalDistanceKm;
-      const coveredKm = curLoc.distanceFromOriginKm || curHalt?.distance || 0;
+      const coveredKm = curLoc.distanceFromOriginKm || prevHalt?.distance || 0;
       const remainingKm = Math.max(0, totalDistance - coveredKm);
       const completionPct = totalDistance > 0 ? Math.round((coveredKm / totalDistance) * 100) : 0;
-      const speed = curHalt?.speedToNextStationKmph || 85;
 
-      // Coordinates
-      const lat = curLoc.coordinates?.lat || curHalt?.lat || 19.076;
-      const lng = curLoc.coordinates?.lng || curHalt?.lng || 72.877;
+      // Route stops for extra data
+      const allStops: RRStop[] = Object.values(data.route || {});
+      const haltStops = allStops.filter((s) => s.isHalt);
 
-      // Current station event
+      // Find the full stop object for current and next halt
+      const curHaltStop = haltStops.find((s) => s.stationCode === (prevHalt?.stationCode || curLoc.stationCode));
+      const nextHaltStop = haltStops.find((s) => s.stationCode === nextHalt?.stationCode);
+      const speed = curHaltStop?.speedToNextStationKmph || nextHaltStop?.speedToNextStationKmph || 85;
+
+      // Build current station
       const curStation: Station = {
-        id: `S-${curHalt?.stationCode || curLoc.stationCode || 'CUR'}`,
-        code: curHalt?.stationCode || curLoc.stationCode || 'CUR',
-        name: curHalt?.stationName || curLoc.stationName || 'Current Station',
+        id: `S-${prevHalt?.stationCode || 'CUR'}`,
+        code: prevHalt?.stationCode || curLoc.stationCode || 'CUR',
+        name: prevHalt?.stationName || curLoc.stationName || 'Current Station',
         latitude: lat,
         longitude: lng,
       };
@@ -423,51 +295,48 @@ export class RailRadarProvider implements IRailProvider {
         journeyId: `J-${trainId}`,
         stationId: curStation.id,
         station: curStation,
-        distanceFromOriginKm: coveredKm,
-        scheduledArrival: this.formatTime(curHalt?.scheduledArrival),
-        actualArrival: this.formatTime(curHalt?.actualArrival),
-        scheduledDeparture: this.formatTime(curHalt?.scheduledDeparture),
-        actualDeparture: this.formatTime(curHalt?.actualDeparture),
-        delayMinutes,
+        distanceFromOriginKm: prevHalt?.distance || coveredKm,
+        scheduledArrival: this.fmtTime(curHaltStop?.scheduledArrival),
+        actualArrival: this.fmtTime(curHaltStop?.actualArrival),
+        scheduledDeparture: this.fmtTime(curHaltStop?.scheduledDeparture),
+        actualDeparture: this.fmtTime(curHaltStop?.actualDeparture),
+        delayMinutes: delay,
         status: 'current',
-        platform: curHalt?.platform || '1',
+        platform: curHaltStop?.platform || '1',
       };
 
-      // Next station event
+      // Build next station
       const nextStation: Station = {
         id: `S-${nextHalt?.stationCode || 'NXT'}`,
         code: nextHalt?.stationCode || 'NXT',
-        name: nextHalt?.stationName || 'Next Station',
-        latitude: nextHalt?.lat || lat + 0.3,
-        longitude: nextHalt?.lng || lng + 0.3,
+        name: nextHalt?.stationName || 'Next Halt',
+        latitude: lat + 0.3,
+        longitude: lng + 0.3,
       };
 
       const nextStationEvent: StationEvent = {
         journeyId: `J-${trainId}`,
         stationId: nextStation.id,
         station: nextStation,
-        distanceFromOriginKm: nextHalt?.distance || coveredKm + 45,
-        scheduledArrival: this.formatTime(nextHalt?.scheduledArrival),
-        actualArrival: this.formatTime(nextHalt?.actualArrival),
-        scheduledDeparture: this.formatTime(nextHalt?.scheduledDeparture),
+        distanceFromOriginKm: nextHalt?.distance || coveredKm + 50,
+        scheduledArrival: this.fmtTime(nextHaltStop?.scheduledArrival),
+        actualArrival: this.fmtTime(nextHaltStop?.actualArrival),
+        scheduledDeparture: this.fmtTime(nextHaltStop?.scheduledDeparture),
         actualDeparture: null,
-        delayMinutes,
+        delayMinutes: delay,
         status: 'upcoming',
-        platform: nextHalt?.platform || '1',
+        platform: nextHaltStop?.platform || '1',
       };
 
-      const statusParts: string[] = [];
+      // Build status text
+      let statusText = '';
       if (data.status === 'completed') {
-        statusParts.push(`Train has arrived at its destination — ${train.destination}.`);
+        statusText = `Arrived at destination — ${train.destination}.`;
       } else {
-        statusParts.push(
-          delayMinutes === 0
-            ? `Running right on time.`
-            : `Running ${delayMinutes} min${delayMinutes > 1 ? 's' : ''} late.`
-        );
-        if (curHalt?.stationName) statusParts.push(`Departed ${curHalt.stationName}.`);
-        if (nextHalt?.stationName) statusParts.push(`Approaching ${nextHalt.stationName}.`);
-        if (speed > 0) statusParts.push(`Speed: ${Math.round(speed)} km/h.`);
+        statusText = delay === 0 ? 'Running on time.' : `Running ${delay} min${delay !== 1 ? 's' : ''} late.`;
+        if (curStation.name !== 'Current Station') statusText += ` Last halt: ${curStation.name}.`;
+        if (nextStation.name !== 'Next Halt') statusText += ` Approaching ${nextStation.name}.`;
+        if (speed > 0) statusText += ` Speed: ${Math.round(speed)} km/h.`;
       }
 
       return {
@@ -483,12 +352,12 @@ export class RailRadarProvider implements IRailProvider {
         },
         currentStation: currentStationEvent,
         nextStation: nextStationEvent,
-        delayMinutes,
+        delayMinutes: delay,
         distanceCoveredKm: coveredKm,
         distanceRemainingKm: remainingKm,
         completionPercentage: Math.min(100, completionPct),
         lastUpdated: data.lastUpdatedAt || new Date().toISOString(),
-        statusText: statusParts.join(' '),
+        statusText,
         hasLiveData: isLive,
         isStale: !isLive,
       };
@@ -499,96 +368,51 @@ export class RailRadarProvider implements IRailProvider {
     return this.fallback.getLiveJourney(trainId);
   }
 
-  // ── ROUTE GEOMETRY ────────────────────────────────────────────────────────
+  // ── Route Geometry ─────────────────────────────────────────────────────────
   async getRouteGeometry(trainId: string): Promise<RouteGeometry | null> {
-    // Fetch route geometry, live run, and static timetable simultaneously for complete details
-    const [routeData, liveData, trainData] = await Promise.all([
+    // Fetch route and live data concurrently (both have independent caching)
+    const [routeData, liveData] = await Promise.all([
       this.get<any>(`/trains/${trainId}/route?format=geojson&stops=true`),
-      this.get<any>(`/trains/${trainId}/live`),
-      this.get<any>(`/trains/${trainId}`),
+      this.get<any>(`/trains/${trainId}/live?authoritative=true`),
     ]);
 
-    if (!routeData && !trainData) return this.fallback.getRouteGeometry(trainId);
+    if (!routeData) return this.fallback.getRouteGeometry(trainId);
 
     try {
-      // 1. Coordinates from GeoJSON polyline
-      const coordinates: [number, number][] = routeData?.geojson?.geometry?.coordinates || [];
+      // 431-point GeoJSON polyline from RailRadar
+      const coordinates: [number, number][] = routeData.geojson?.geometry?.coordinates || [];
 
-      // 2. Stops from routeData
-      const rawStops: RRRouteStop[] = Array.isArray(routeData?.stops)
+      // All stops from the route endpoint (true array, 111 stops)
+      const allRouteStops: RRRouteStop[] = Array.isArray(routeData.stops)
         ? routeData.stops
-        : Object.values(routeData?.stops || {});
+        : Object.values(routeData.stops || {});
 
-      // 3. Halt status and timing from live route or static timetable
-      const liveRoute: RRStop[] = liveData
-        ? (Array.isArray(liveData.route) ? liveData.route : Object.values(liveData.route || {}))
-        : [];
-      const timetableRoute: any[] = trainData
-        ? (Array.isArray(trainData.route) ? trainData.route : Object.values(trainData.route || {}))
-        : [];
+      // Live route for status enrichment
+      const liveStops: RRStop[] = liveData ? Object.values(liveData.route || {}) : [];
+      const liveHaltMap: Record<string, RRStop> = {};
+      liveStops.forEach((s) => {
+        if (s.isHalt) liveHaltMap[s.stationCode] = s;
+      });
 
-      const haltStatusMap: Record<string, any> = {};
-      if (liveRoute.length > 0) {
-        liveRoute.forEach((s) => {
-          haltStatusMap[s.stationCode] = s;
-        });
-      } else {
-        timetableRoute.forEach((s) => {
-          const code = s.station?.code || s.stationCode || s.code;
-          if (code) {
-            haltStatusMap[code] = {
-              stationCode: code,
-              stationName: s.station?.name || s.name,
-              isHalt: s.isHalt !== false,
-              status: 'upcoming',
-              distance: s.distance || 0,
-              scheduledArrival: s.arrival,
-              scheduledDeparture: s.departure,
-              platform: s.platform || '1',
-              delayArrival: 0,
-              delayDeparture: 0,
-            };
-          }
-        });
-      }
+      // Only show halting stations in the timeline  
+      const haltRouteStops = allRouteStops.filter((s) => {
+        // A stop is a halt if the live data marks it as isHalt, or if it's the origin/dest
+        const ls = liveHaltMap[s.code];
+        if (ls) return true;
+        // For trains where live data isn't available, show all stops every ~50km apart
+        return false;
+      });
 
-      // Filter to halting stations if known, otherwise keep all route stops
-      let haltStops: RRRouteStop[] = rawStops;
-      if (rawStops.length > 0) {
-        const filtered = rawStops.filter((s) => {
-          const info = haltStatusMap[s.code];
-          return info ? info.isHalt : true;
-        });
-        if (filtered.length >= 2) {
-          haltStops = filtered;
-        }
-      } else if (timetableRoute.length > 0) {
-        // Synthesize route stops from timetable if routeData had no stops
-        haltStops = timetableRoute
-          .filter((s) => s.isHalt !== false)
-          .map((s, idx) => ({
-            sequence: s.sequence || idx + 1,
-            code: s.station?.code || s.stationCode || `ST${idx}`,
-            name: s.station?.name || s.name || 'Station',
-            lat: s.station?.lat || 0,
-            lng: s.station?.lng || 0,
-          }));
-      }
+      // Fallback: if no halts identified (no live data), show all route stops
+      const stopsToRender = haltRouteStops.length > 0 ? haltRouteStops : allRouteStops;
 
-      // If coordinates array was empty, build from station lat/lng
-      if (coordinates.length === 0 && haltStops.length > 0) {
-        haltStops.forEach((st) => {
-          if (st.lng && st.lat) {
-            coordinates.push([st.lng, st.lat]);
-          }
-        });
-      }
-
-      const stations: StationEvent[] = haltStops.map((s) => {
-        const liveStop = haltStatusMap[s.code];
-        const rrStatus = liveStop?.status || (s.sequence === 1 ? 'departed' : 'not-departed');
+      const stations: StationEvent[] = stopsToRender.map((s) => {
+        const ls = liveHaltMap[s.code];
+        const rrStatus = ls?.status;
         const status: StationEvent['status'] =
-          rrStatus === 'at-station' ? 'current' : rrStatus === 'departed' ? 'passed' : 'upcoming';
+          rrStatus === 'at-station' ? 'current'
+            : rrStatus === 'departed' ? 'passed'
+              : 'upcoming';
 
         return {
           journeyId: `J-${trainId}`,
@@ -600,14 +424,14 @@ export class RailRadarProvider implements IRailProvider {
             latitude: s.lat,
             longitude: s.lng,
           } as Station,
-          distanceFromOriginKm: liveStop?.distance || 0,
-          scheduledArrival: this.formatTime(liveStop?.scheduledArrival || liveStop?.arrival),
-          actualArrival: this.formatTime(liveStop?.actualArrival),
-          scheduledDeparture: this.formatTime(liveStop?.scheduledDeparture || liveStop?.departure),
-          actualDeparture: this.formatTime(liveStop?.actualDeparture),
-          delayMinutes: liveStop?.delayDeparture || liveStop?.delayArrival || 0,
+          distanceFromOriginKm: ls?.distance || 0,
+          scheduledArrival: this.fmtTime(ls?.scheduledArrival),
+          actualArrival: this.fmtTime(ls?.actualArrival),
+          scheduledDeparture: this.fmtTime(ls?.scheduledDeparture),
+          actualDeparture: this.fmtTime(ls?.actualDeparture),
+          delayMinutes: ls?.delayDeparture || ls?.delayArrival || 0,
           status,
-          platform: liveStop?.platform || '1',
+          platform: ls?.platform || '—',
         };
       });
 
@@ -623,7 +447,7 @@ export class RailRadarProvider implements IRailProvider {
     return this.fallback.getRouteGeometry(trainId);
   }
 
-  // ── JOURNEY ANALYTICS ─────────────────────────────────────────────────────
+  // ── Journey Analytics ──────────────────────────────────────────────────────
   async getJourneyAnalytics(trainId: string): Promise<JourneyAnalytics | null> {
     const [live, route] = await Promise.all([
       this.getLiveJourney(trainId),
@@ -632,21 +456,16 @@ export class RailRadarProvider implements IRailProvider {
 
     if (!live || !route) return this.fallback.getJourneyAnalytics(trainId);
 
-    // Build elevation profile using station lat/lng from route stops
-    // We approximate Indian terrain elevations per geographic region
     const elevationProfile = route.stations.map((st, i) => {
       const lat = st.station.latitude;
       const lng = st.station.longitude;
-      // Rough terrain elevation estimate: higher in central/western Ghats, lower in coastal/Gangetic plains
-      const baseElev = Math.round(
-        50 +
-          Math.abs(Math.sin(lat * 0.25) * 400) +
-          Math.abs(Math.cos(lng * 0.12) * 200) +
-          Math.sin(i * 0.6) * 80
-      );
+      // Approximate terrain elevation from lat/lng (Indian terrain)
+      const elev = Math.max(10, Math.round(
+        50 + Math.abs(Math.sin(lat * 0.25) * 400) + Math.abs(Math.cos(lng * 0.12) * 200) + Math.sin(i * 0.6) * 80
+      ));
       return {
         distanceKm: st.distanceFromOriginKm,
-        elevationMeters: Math.max(10, baseElev),
+        elevationMeters: elev,
         stationName: st.station.name,
       };
     });
@@ -663,7 +482,7 @@ export class RailRadarProvider implements IRailProvider {
       averageSpeedKmph: live.train.totalDistanceKm > 0
         ? Math.round(live.train.totalDistanceKm / (live.train.expectedDurationMinutes / 60))
         : 80,
-      topSpeedKmph: live.position.speedKmph > 0 ? Math.round(live.position.speedKmph * 1.2) : 110,
+      topSpeedKmph: Math.max(live.position.speedKmph, 110),
       distanceCoveredKm: live.distanceCoveredKm,
       distanceRemainingKm: live.distanceRemainingKm,
       totalDistanceKm: live.train.totalDistanceKm,
@@ -686,12 +505,12 @@ export class RailRadarProvider implements IRailProvider {
     };
   }
 
-  // ── WEATHER ──────────────────────────────────────────────────────────────
+  // ── Weather ────────────────────────────────────────────────────────────────
   async getWeather(lat: number, lng: number): Promise<WeatherInfo> {
     return this.weather.getWeather(lat, lng);
   }
 
-  // ── JOURNEY WEATHER COMPANION ────────────────────────────────────────────
+  // ── Journey Weather Companion ──────────────────────────────────────────────
   async getJourneyWeather(trainId: string): Promise<JourneyWeatherCompanion | null> {
     const [live, route] = await Promise.all([
       this.getLiveJourney(trainId),
@@ -702,40 +521,40 @@ export class RailRadarProvider implements IRailProvider {
       return this.fallback.getJourneyWeather(trainId);
     }
 
-    const curStation = live.currentStation.station;
-    const nextStation = live.nextStation.station;
-    const destStation = route.stations[route.stations.length - 1].station;
+    const cur = live.currentStation.station;
+    const nxt = live.nextStation.station;
+    const dest = route.stations[route.stations.length - 1].station;
 
-    const [curW, nextW, destW] = await Promise.all([
-      this.getWeather(curStation.latitude, curStation.longitude),
-      this.getWeather(nextStation.latitude, nextStation.longitude),
-      this.getWeather(destStation.latitude, destStation.longitude),
+    const [curW, nxtW, destW] = await Promise.all([
+      this.getWeather(cur.latitude, cur.longitude),
+      this.getWeather(nxt.latitude, nxt.longitude),
+      this.getWeather(dest.latitude, dest.longitude),
     ]);
 
     return {
       trainId,
       currentStationWeather: {
         stationType: 'current',
-        stationCode: curStation.code,
-        stationName: curStation.name,
-        weather: { ...curW, locationName: curStation.name },
+        stationCode: cur.code,
+        stationName: cur.name,
+        weather: { ...curW, locationName: cur.name },
       },
       nextStationWeather: {
         stationType: 'next',
-        stationCode: nextStation.code,
-        stationName: nextStation.name,
-        weather: { ...nextW, locationName: nextStation.name },
+        stationCode: nxt.code,
+        stationName: nxt.name,
+        weather: { ...nxtW, locationName: nxt.name },
       },
       destinationStationWeather: {
         stationType: 'destination',
-        stationCode: destStation.code,
-        stationName: destStation.name,
-        weather: { ...destW, locationName: destStation.name },
+        stationCode: dest.code,
+        stationName: dest.name,
+        weather: { ...destW, locationName: dest.name },
       },
     };
   }
 
-  // ── ROUTE CONTEXT ────────────────────────────────────────────────────────
+  // ── Route Context ──────────────────────────────────────────────────────────
   async getRouteContext(lat: number, lng: number): Promise<TravelCompanionContext> {
     const wx = await this.getWeather(lat, lng);
     const ctx = await this.fallback.getRouteContext(lat, lng);

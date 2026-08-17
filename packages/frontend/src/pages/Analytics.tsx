@@ -133,9 +133,33 @@ export const Analytics: React.FC = () => {
           </svg>
         </div>
 
-        <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '12px', color: 'var(--text-tertiary)', marginTop: '12px' }}>
+        <div
+          style={{
+            display: 'flex',
+            flexWrap: 'wrap',
+            gap: '10px 16px',
+            fontSize: '12px',
+            color: 'var(--text-tertiary)',
+            marginTop: '16px',
+            paddingTop: '12px',
+            borderTop: '1px solid rgba(0,0,0,0.06)',
+          }}
+        >
           {analytics.elevationProfile.map((p, idx) => (
-            <span key={idx}>{p.stationName} ({p.elevationMeters}m)</span>
+            <div
+              key={idx}
+              style={{
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: '6px',
+                padding: '4px 10px',
+                backgroundColor: 'var(--bg-secondary)',
+                borderRadius: 'var(--radius-sm)',
+              }}
+            >
+              <span style={{ fontWeight: 600, color: 'var(--text-primary)' }}>{p.stationName}</span>
+              <span style={{ color: 'var(--accent-primary)', fontWeight: 700 }}>({p.elevationMeters}m)</span>
+            </div>
           ))}
         </div>
       </section>

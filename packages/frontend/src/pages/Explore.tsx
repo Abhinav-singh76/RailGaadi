@@ -8,21 +8,23 @@ import { StationWeather } from '@railgaadi/types';
 export const Explore: React.FC = () => {
   const { trainId = '20901' } = useParams<{ trainId: string }>();
 
-  const { data: liveStatus } = useQuery({
-    queryKey: ['liveJourney', trainId],
-    queryFn: () => getLiveJourney(trainId),
-  });
-
-  const lat = liveStatus?.position.latitude || 28.6139;
-  const lng = liveStatus?.position.longitude || 77.2090;
-
   const { data: journeyWeather, isLoading: isWeatherLoading } = useQuery({
     queryKey: ['journeyWeather', trainId],
     queryFn: () => getJourneyWeather(trainId),
   });
 
+  // Get live position first, then use real coordinates for context
+  const { data: liveStatus } = useQuery({
+    queryKey: ['liveJourney', trainId],
+    queryFn: () => getLiveJourney(trainId),
+    staleTime: 60_000,
+  });
+
+  const lat = liveStatus?.position?.latitude ?? 19.076;
+  const lng = liveStatus?.position?.longitude ?? 72.877;
+
   const { data: context, isLoading: isContextLoading } = useQuery({
-    queryKey: ['routeContext', trainId, lat, lng],
+    queryKey: ['routeContext', trainId, Math.round(lat * 10), Math.round(lng * 10)],
     queryFn: () => getRouteContext(lat, lng),
   });
 
